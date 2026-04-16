@@ -1,269 +1,155 @@
-# DynaGraph — KG-Enhanced Multi-Hop QA Serving
+# DynaGraph: Holistic Optimization for Latency-Critical GraphRAG Serving via Bidirectional Feedback
 
-DynaGraph is a KG-guided multi-hop QA serving system that jointly
-adapts retrieval budget and request scheduling under an end-to-end
-latency SLO. The accompanying paper (full version in
-[`paper_full_version.pdf`](./paper_full_version.pdf)) introduces three
-coupled modules that form the C5 configuration reported in the main
-tables:
+Anonymous code release accompanying the submission. The full paper is
+at [`paper_full_version.pdf`](./paper_full_version.pdf).
 
-- **P1 — Graph topology features.** For every retrieved top-K set we
-  extract `bridge_doc_ratio`, `entity_overlap_density`, and
-  `n_unique_entities` from the LLM-extracted KG.
-- **P2 — Adaptive-K aggregator.** A training-free linear scorer maps
-  the graph features to a per-query K budget (`src/adaptive_aggregator.py`).
-  Queue pressure from P3 decays K exponentially as load builds.
-- **P3 — SLO-priority scheduler.** Graph-enhanced priority
-  (`src/utils/joint_priority.py`) combines `S_diff` with estimated
-  prompt tokens so that easy-but-short requests do not block hard
-  queries near their SLO deadline.
+DynaGraph is a serving framework for knowledge-graph-enhanced
+multi-hop question answering under a time-to-first-token (TTFT)
+service level objective. The framework establishes a bidirectional
+feedback loop across three phases:
 
-The online benchmark (`src/benchmark_e2e_joint.py`) replays a Zipf
-arrival process of 1000 unique questions × 3000 total requests at 30
-QPS against a running vLLM / SGLang server and reports TTFT, SLO
-attainment, F1, accuracy, and QA-Goodput.
+- **Phase 1 — Sensor.** Builds a query-induced subgraph and extracts a
+  topological feature vector that proxies query complexity.
+- **Phase 2 — Controller.** Allocates a per-query evidence budget from
+  the Phase-1 features and a live backpressure signal from Phase 3,
+  and assembles the prompt.
+- **Phase 3 — Actuator.** Runs an SLO-aware priority queue that orders
+  requests by urgency and estimated prefill cost, and reports queue
+  pressure back to Phase 2.
 
-> **Anonymous submission.** This repository is released for
-> double-blind review. Please report any residual identifying strings
-> via the submission portal.
+The objective is *QA-Goodput*: the rate of responses that are both
+correct and delivered within the TTFT deadline.
 
 ---
 
-## Contents
+## Repository layout
 
 ```
 DynaGraph-Release/
-├── src/                  # method + online benchmark + pipeline
-├── scripts/              # server launchers + run wrappers
-├── data/                 # raw 1000q corpora & queries (3 datasets)
-├── tmp_data/             # graph features (committed); retrieval results via external zip
+├── src/                                     # method + benchmark + pipeline
+├── scripts/                                 # server launchers & runners
+├── data/                                    # 1000-query corpora & queries
+├── tmp_data/                                # graph features (committed)
+├── dynagraph_intermediate_artifacts.zip     # Phase-1 outputs (unzip before use)
 ├── paper_full_version.pdf
-├── downloads_manifest.md # external artifact list
 └── requirements.txt
 ```
 
-Three public datasets are bundled (`2wikimultihopqa`, `hotpotqa`,
-`musique`). For each dataset `data/{name}.json` holds the 1000
-questions and `data/{name}_corpus.json` holds the associated passages.
+Models used (download once from Hugging Face):
 
----
-
-## Reproducibility modes
-
-There are two paths. **We recommend the pure-QA path** for reviewing:
-it skips Phase-1 retrieval entirely and reproduces the benchmark
-numbers using bundled intermediate artifacts.
-
-### Mode A — Pure-QA (recommended)
-
-1. Clone the repo.
-2. Unpack the bundled intermediate artifacts at the repo root:
-
-   ```bash
-   unzip dynagraph_intermediate_artifacts.zip -d .
-   sha256sum -c SHA256SUMS.txt
-   ```
-3. Install dependencies: `pip install -r requirements.txt` plus one
-   serving backend (vLLM 0.17+ **or** SGLang 0.4.5+).
-4. Start an LLM server — see §"LLM server configurations" below.
-5. Warm the server once (a single `curl /v1/models` is enough).
-6. Run the benchmark:
-
-   ```bash
-   bash scripts/run_c5_all_datasets.sh qwen3.5-4b 8000 64 30 3000
-   ```
-
-This goes straight from the cached retrieval arrays to the online
-benchmark. Expected wall-clock: ~3 minutes per dataset on dual
-RTX 4090 with a warmed Qwen3.5-4B TP2 server.
-
-### Mode B — End-to-End from scratch
-
-If you want to regenerate every intermediate artifact, you also need an
-embedding server (Qwen3-Embedding-0.6B) and a reranker server
-(bge-reranker-v2-m3) next to the LLM server.
-
-```bash
-# Each in its own terminal:
-MODEL_PATH=/path/to/Qwen3-Embedding-0.6B  bash scripts/start_embedding_server.sh
-MODEL_PATH=/path/to/bge-reranker-v2-m3    bash scripts/start_reranker_server.sh
-MODEL_PATH=/path/to/Qwen3.5-4B            bash scripts/start_vllm_qwen35_4b_tuned.sh
-
-# Then rebuild KG triples, retrieval, and graph features for all 3 datasets:
-bash scripts/run_pipeline_from_scratch.sh qwen3.5-4b 35B
-
-# Finally run the benchmark:
-bash scripts/run_c5_all_datasets.sh qwen3.5-4b 8000 64 30 3000
-```
-
-Wall-clock for Mode B on dual 4090 (all three datasets): several hours,
-dominated by KG extraction and full-corpus retrieval.
-
----
-
-## LLM server configurations
-
-The released scripts expose the parameters we tuned for the paper.
-Override paths with `MODEL_PATH=/absolute/path/to/model` — no model
-weights live in this repo.
-
-### vLLM (recommended)
-
-#### Qwen3.5-4B — C5 anchor (main paper setting)
-
-```bash
-MODEL_PATH=/path/to/Qwen3.5-4B \
-  bash scripts/start_vllm_qwen35_4b_tuned.sh
-```
-
-Key flags this script sets for you:
-
-- tensor-parallel 2, FLASHINFER attention
-- `gpu-memory-utilization 0.85`
-- `max-model-len 23000`, `max-num-batched-tokens 8192`, `max-num-seqs 64`
-- `kv-cache-dtype fp8`, `enable-prefix-caching`, `enable-chunked-prefill`
-- `performance-mode throughput`
-- `reasoning-parser qwen3` (required — Qwen3.5 defaults to thinking mode)
-
-> **Warm the server once before any TTFT-sensitive measurement**, or
-> the first request's CUDA-graph compile will dominate p99.
-
-#### Qwen3.5-9B / 35B (characterisation sweeps)
-
-```bash
-MODEL_PATH=/path/to/Qwen3.5-9B \
-  bash scripts/start_vllm_qwen35_tp2.sh 9B
-
-MODEL_PATH=/path/to/Qwen3.5-35B-A3B-FP8 \
-  bash scripts/start_vllm_qwen35_tp2.sh 35B
-```
-
-35B is a FP8 MoE model and uses `max-num-seqs=8`,
-`performance-mode=interactivity`, `--enable-expert-parallel`,
-`--all2all-backend allgather_reducescatter`, `kv-cache-dtype=auto`
-for stability on dual 4090. This is a low-QPS characterisation config,
-not the paper main setting.
-
-#### Qwen3-4B-Instruct-2507 (historical baseline / LMCache-compatible)
-
-```bash
-MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 \
-  bash scripts/start_vllm_qwen3_4b.sh
-```
-
-### SGLang (alternative)
-
-SGLang support is kept as a fallback; the main-paper numbers were
-collected under vLLM because Qwen3.5's GDN / hybrid attention path is
-most mature there.
-
-```bash
-MODEL_PATH=/path/to/Qwen3.5-4B \
-  bash scripts/start_sglang_qwen35_4b.sh
-
-MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 \
-  bash scripts/start_sglang_qwen3_4b.sh
-```
-
-### Client-side note
-
-Every local OpenAI-compatible client must bypass proxy env vars; the
-code already sets `httpx.Client(trust_env=False)`. For Qwen3.5 models
-the client must also pass
-`extra_body={"chat_template_kwargs": {"enable_thinking": False}}` on
-every request — our benchmark script does this automatically.
-
----
-
-## Running the benchmark
-
-### Full paper main setting (all 3 datasets, C5)
-
-```bash
-bash scripts/run_c5_all_datasets.sh qwen3.5-4b 8000 64 30 3000
-```
-
-### Single dataset, single config
-
-```bash
-python src/benchmark_e2e_joint.py \
-  --dataset 2wikimultihopqa \
-  --source_exp_id baseline_v3 \
-  --config C5 \
-  --arrival zipf --zipf_alpha 1.0 --rate 30 \
-  --questions 1000 --total_requests 3000 \
-  --concurrency 64 --slo_ttft_ms 2000 \
-  --k_min 10 --k_max 20 \
-  --bp_k_max 19 --bp_threshold 0.7 \
-  --k_mapping linear --bp_decay exponential \
-  --engine vllm --port 8000 --api_key api-key-qwen3 \
-  --model_name_tag qwen3.5-4b \
-  --exp_id C5_demo
-```
-
-`source_exp_id` must match the retrieval filename stored under
-`tmp_data/{dataset}/retrieve_result_4B_{source_exp_id}.npy`. The three
-defaults are:
-
-| Dataset | `source_exp_id` |
+| Role | Hugging Face |
 |---|---|
-| 2WikiMultihopQA | `baseline_v3` |
-| HotpotQA | `baseline_full_1000q` |
-| MuSiQue | `1` |
+| Default LLM | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) |
+| Alternative LLM | [Qwen/Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) |
+| Embedding | [Qwen/Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
+| Reranker | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) |
 
-### Standalone P2 evaluation (no server needed)
+Default results are reported on **Qwen3.5-4B** (2× RTX 4090, TP=2).
 
-For fast offline iteration of the adaptive-K logic:
+---
+
+## Environment
+
+Python 3.11, CUDA 12.8.
 
 ```bash
-bash scripts/run_standalone_eval.sh 2wikimultihopqa joint C5_standalone
+pip install -r requirements.txt
+pip install vllm==0.17.1           # recommended; or:
+pip install "sglang[all]>=0.5.9"   # alternative
 ```
 
 ---
 
-## Expected results (Qwen3.5-4B TP2, Zipf@30 QPS, 3000 req)
+## Main setting (reviewer fast path)
 
-These are the C5 numbers reported in the paper; small variation (±1 pp
-F1, ±2 pp QA-GP) across server instances is normal and usually
-traceable to cache-warmth variation.
+The benchmark expects the Phase-1 artifacts to be present in
+`tmp_data/`. The default LLM is Qwen3.5-4B.
 
-| Dataset | SLO@2s | QA-Goodput | F1 | avg K | TTFT p50 |
-|---|---|---|---|---|---|
-| 2Wiki   | 98.5 % | 87.4 % | 0.796 | 14.3 | 255 ms |
-| HotpotQA| 99.0 % | 86.5 % | 0.770 | 14.5 | 225 ms |
-| MuSiQue | 98.4 % | 63.6 % | 0.492 | 14.2 | 190 ms |
+```bash
+# 1. Unpack Phase-1 artifacts
+unzip dynagraph_intermediate_artifacts.zip -d .
+
+# 2. Start the LLM server on two GPUs (priority scheduling enabled)
+MODEL_PATH=/path/to/Qwen3.5-4B bash scripts/start_vllm_qwen35_4b.sh
+
+# 3. Warm up the server (REQUIRED — see note below)
+bash scripts/warmup_server.sh
+
+# 4. Run the benchmark on all three datasets
+bash scripts/run_dynagraph.sh
+```
+
+The benchmark replays Zipf α=1.0, 1000 unique queries, 3000 total
+requests, 30 QPS, concurrency 64, TTFT SLO 2000 ms. Per-request JSON
+reports land under `tmp_data/{dataset}/`.
+
+> **Why warmup matters.** Without warmup the first ~200 requests of
+> each run hit cold CUDA graphs, an empty prefix cache, and unreached
+> priority-queue steady state. TTFT for those requests can reach 8+ s,
+> which distorts SLO attainment and QA-Goodput. The provided script
+> sends 300 realistic QA-formatted requests before measurement.
+
+### Using Qwen3-4B-Instruct-2507 instead
+
+```bash
+MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 bash scripts/start_vllm_qwen3_4b.sh
+bash scripts/warmup_server.sh qwen3-4b
+bash scripts/run_dynagraph.sh qwen3-4b
+```
+
+### Using SGLang (>= 0.5.9) instead
+
+```bash
+MODEL_PATH=/path/to/Qwen3.5-4B bash scripts/start_sglang_qwen35_4b.sh
+# warmup + run_dynagraph as above
+```
+
+---
+
+## End-to-end pipeline
+
+The end-to-end path regenerates every Phase-1 artifact from only the
+committed corpus and query JSONs. It requires three servers co-located
+on two GPUs:
+
+- **GPU 0** — LLM server.
+- **GPU 1** — embedding server and reranker server (they share GPU 1).
+
+```bash
+# GPU 0: LLM
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=/path/to/Qwen3.5-4B \
+  bash scripts/start_vllm_qwen35_4b.sh
+
+# GPU 1: embedding server
+CUDA_VISIBLE_DEVICES=1 MODEL_PATH=/path/to/Qwen3-Embedding-0.6B \
+  bash scripts/start_embedding_server.sh
+
+# GPU 1: reranker server (shares GPU 1 with the embedding server)
+CUDA_VISIBLE_DEVICES=1 MODEL_PATH=/path/to/bge-reranker-v2-m3 \
+  bash scripts/start_reranker_server.sh
+
+# Regenerate retrieval + KG + graph features, then run the benchmark:
+bash scripts/run_pipeline_from_scratch.sh qwen3.5-4b 4B
+bash scripts/warmup_server.sh
+bash scripts/run_dynagraph.sh
+```
+
+When the LLM uses TP=2 across both GPUs, lower `GPU_MEM` in the
+LLM launcher so the embedding + reranker servers can share the memory.
+
+The from-scratch path takes several hours on dual 4090s; use the main
+setting above for quick verification.
 
 ---
 
 ## Scope of this release
 
-This release focuses on the DynaGraph main method and the three-dataset
-benchmark that drives Table 1–3 of the paper. The following are
-**intentionally omitted** and documented only in the paper:
+DynaGraph main method on 2WikiMultihopQA, HotpotQA, and MuSiQue.
 
-- Baselines (HippoRAG, SiReRAG, KET-RAG, CacheBlend/LMCache, DepCache,
-  ClueRAG, CompSelect, RAG-CSM, Adaptive-k)
-- RQ5 full-dev AUROC scalability (12 K queries)
-- RQ6 QPS sweep and RQ7 model-size scaling tables
-- Phase-2 alternatives study (binary classifier, two-pass, bridge-aware)
+Baselines (HippoRAG, SiReRAG, KET-RAG, CacheBlend, DepCache, etc.),
+full-dev scalability, QPS sweeps, and additional ablations appear only
+in the paper.
 
-All of these are reproducible from the same codebase with additional
-scripts and data; we omit them here to keep the release focused on the
-method itself.
+## License
 
----
-
-## Directory pointers
-
-- `src/adaptive_aggregator.py` — P2 adaptive K logic (full `joint`,
-  `binary_adaptive`, baseline `adaptive_k` / `uniform_budget` modes).
-- `src/utils/joint_priority.py` — P3 priority scheduler.
-- `src/graph_feature_extractor.py` — P1 graph feature extraction.
-- `src/benchmark_e2e_joint.py` — online benchmark driver.
-- `src/eval_phase2_standalone.py` — offline P2 evaluator.
-- `src/pipeline_baseline.py` — Phase-1 retrieval pipeline (from
-  scratch).
-
-## Citation
-
-Anonymous for submission.
+Apache-2.0 — see [`LICENSE`](./LICENSE).

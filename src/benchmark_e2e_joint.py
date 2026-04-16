@@ -6,16 +6,13 @@ Implements the full feedback loop:
   P2 → P3: difficulty + prompt_tokens feed priority scheduling
   P3 → P2: queue_utilization (backpressure) feeds back to K decision
 
-Experiments:
-  C1: Isolated baseline (no signals, K=20, priority=0)
-  C2: +P1→P3 graph signal only (K=20, graph priority)
-  C3: +P2 adaptive only (difficulty K, no priority signal)
-  C4: +P3→P2 backpressure only (K capped under load)
-  C5: Full Joint (P1+P2+P3 with all feedback)
+The main config is ``DynaGraph`` (full Phase 1 + Phase 2 + Phase 3 with
+bidirectional feedback). Additional ablation configs are kept for
+reference.
 
 Usage (200q quick test):
   python src/benchmark_e2e_joint.py --dataset 2wikimultihopqa --questions 200 \
-    --arrival poisson --rate 5 --config C5 --exp_id C5_quick_200q
+    --arrival poisson --rate 5 --config DynaGraph --exp_id demo
 """
 
 import argparse
@@ -184,30 +181,15 @@ def build_prompt(question, contexts, dataset):
 # ===================== Experiment Configs =====================
 
 EXPERIMENT_CONFIGS = {
-    "C1": {  # Isolated baseline
-        "agg_mode": "full", "strategy": "none",
-        "graph_weight": 0, "slo_weight": 0, "cost_weight": 0,
-        "use_difficulty_signal": False,
-    },
-    "C2": {  # +P1→P3 graph signal only
-        "agg_mode": "full", "strategy": "graph_slo",
-        "graph_weight": 1.0, "slo_weight": 0, "cost_weight": 0,
-        "use_difficulty_signal": False,
-    },
-    "C3": {  # +P2 adaptive only
-        "agg_mode": "difficulty", "strategy": "none",
-        "graph_weight": 0, "slo_weight": 0, "cost_weight": 0,
-        "use_difficulty_signal": False,
-    },
-    "C4": {  # +P3→P2 backpressure
-        "agg_mode": "backpressure", "strategy": "none",
-        "graph_weight": 0, "slo_weight": 0, "cost_weight": 0,
-        "use_difficulty_signal": False,
-    },
-    "C5": {  # Full Joint
+    "DynaGraph": {  # Full method: Phase 1 + Phase 2 + Phase 3 with bidirectional feedback
         "agg_mode": "joint", "strategy": "graph_slo",
         "graph_weight": 1.0, "slo_weight": 1.0, "cost_weight": 0.2,
         "use_difficulty_signal": True,
+    },
+    "Baseline": {  # Isolated baseline: no signals, K=K_max, FCFS
+        "agg_mode": "full", "strategy": "none",
+        "graph_weight": 0, "slo_weight": 0, "cost_weight": 0,
+        "use_difficulty_signal": False,
     },
     "B4": {  # Joint graph+SLO priority (no adaptive K)
         "agg_mode": "full", "strategy": "graph_slo",
@@ -399,7 +381,7 @@ def main():
     parser.add_argument("--tmp_base", default=os.path.join(_REPO_ROOT, "tmp_data"))
     parser.add_argument("--graph_features", default=None)
 
-    parser.add_argument("--config", default="C5")
+    parser.add_argument("--config", default="DynaGraph")
     parser.add_argument("--arrival", default="poisson", choices=["sequential", "poisson", "zipf"])
     parser.add_argument("--rate", type=float, default=5.0)
     parser.add_argument("--total_requests", type=int, default=0)

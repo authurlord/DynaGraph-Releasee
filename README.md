@@ -1,7 +1,7 @@
 # DynaGraph: Holistic Optimization for Latency-Critical GraphRAG Serving via Bidirectional Feedback
 
 Anonymous code release accompanying the submission. The full paper is
-at [`paper_full_version.pdf`](./paper_full_version.pdf).
+at [`paper_full_version.pdf`](./paper-full-version.pdf).
 
 DynaGraph is a serving framework for knowledge-graph-enhanced
 multi-hop question answering under a time-to-first-token (TTFT)
